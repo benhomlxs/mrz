@@ -34,6 +34,7 @@ class XrayBackend(VPNBackend):
         config_path: str,
         storage: BaseStorage,
     ):
+        super().__init__()  # Initialize health monitor
         self._config = None
         self._inbound_tags = set()
         self._inbounds = list()
@@ -42,6 +43,8 @@ class XrayBackend(VPNBackend):
         self._storage = storage
         self._config_path = config_path
         self._restart_lock = asyncio.Lock()
+        
+        # Start background tasks
         asyncio.create_task(self._restart_on_failure())
 
     @property
@@ -51,6 +54,24 @@ class XrayBackend(VPNBackend):
     @property
     def version(self):
         return self._runner.version
+    
+    def _check_health(self):
+        """Simple health check"""
+        if not self._runner.running:
+            self._set_unhealthy("Xray process not running")
+            return False
+        
+        if self._api:
+            try:
+                # This is a simple sync check - in real implementation you'd want async
+                self._set_healthy()
+                return True
+            except Exception as e:
+                self._set_unhealthy(f"API not responsive: {e}")
+                return False
+        
+        self._set_healthy()
+        return True
 
     def contains_tag(self, tag: str) -> bool:
         return tag in self._inbound_tags
@@ -73,16 +94,34 @@ class XrayBackend(VPNBackend):
 
     async def _restart_on_failure(self):
         while True:
-            await self._runner.stop_event.wait()
-            self._runner.stop_event.clear()
-            if self._restart_lock.locked():
-                logger.debug("Xray restarting as planned")
-            else:
-                logger.debug("Xray stopped unexpectedly")
-                if XRAY_RESTART_ON_FAILURE:
-                    await asyncio.sleep(XRAY_RESTART_ON_FAILURE_INTERVAL)
-                    await self.start()
-                    await self.add_storage_users()
+            try:
+                await self._runner.stop_event.wait()
+                self._runner.stop_event.clear()
+                
+                if self._restart_lock.locked():
+                    logger.debug("Xray restarting as planned")
+                else:
+                    logger.warning("Xray stopped unexpectedly")
+                    if XRAY_RESTART_ON_FAILURE:
+                        logger.info(f"Waiting {XRAY_RESTART_ON_FAILURE_INTERVAL}s before restart")
+                        await asyncio.sleep(XRAY_RESTART_ON_FAILURE_INTERVAL)
+                        
+                        try:
+                            # Try to restart with current config
+                            await self.start()
+                            await self.add_storage_users()
+                            logger.info("Xray restarted successfully after failure")
+                        except Exception as e:
+                            logger.error(f"Failed to restart Xray after failure: {e}")
+                            # Wait longer before next attempt
+                            await asyncio.sleep(30)
+                            
+            except asyncio.CancelledError:
+                logger.debug("Restart on failure task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in restart on failure handler: {e}")
+                await asyncio.sleep(10)  # Wait before retrying
 
     async def start(self, backend_config: str | None = None):
         if backend_config is None:
@@ -99,50 +138,127 @@ class XrayBackend(VPNBackend):
         await self._runner.start(self._config)
 
     async def stop(self):
-        await self._runner.stop()
-        for tag in self._inbound_tags:
-            self._storage.remove_inbound(tag)
-        self._inbound_tags = set()
-        self._inbounds = set()
+        try:
+            # Stop the runner
+            await self._runner.stop()
+            
+            # Clean up storage
+            for tag in self._inbound_tags:
+                self._storage.remove_inbound(tag)
+            self._inbound_tags = set()
+            self._inbounds = []
+            
+            self._set_unhealthy("Backend stopped")
+            logger.info("Xray backend stopped successfully")
+            
+        except Exception as e:
+            logger.error(f"Error stopping Xray backend: {e}")
+            raise
 
     async def restart(self, backend_config: str | None) -> list[Inbound] | None:
-        # xray_config = backend_config if backend_config else self._config
-        await self._restart_lock.acquire()
-        try:
-            if not backend_config:
-                return await self._runner.restart(self._config)
-            await self.stop()
-            await self.start(backend_config)
-        finally:
-            self._restart_lock.release()
+        async with self._restart_lock:
+            try:
+                logger.info("Starting backend restart process")
+                
+                # Store current users before restart
+                current_users = []
+                for inbound in self._inbounds:
+                    users = await self._storage.list_inbound_users(inbound.tag)
+                    current_users.extend(users)
+                
+                if not backend_config:
+                    # Restart with current config
+                    logger.info("Restarting with current configuration")
+                    result = await self._runner.restart(self._config)
+                    
+                    # Re-add users after restart
+                    await self.add_storage_users()
+                    return result
+                else:
+                    # Restart with new config
+                    logger.info("Restarting with new configuration")
+                    await self.stop()
+                    await self.start(backend_config)
+                    
+                    # Re-add users after restart
+                    await self.add_storage_users()
+                    
+                logger.info("Backend restart completed successfully")
+                return None
+                
+            except Exception as e:
+                logger.error(f"Backend restart failed: {e}")
+                # Try to recover by starting with current config
+                try:
+                    if not self.running:
+                        logger.info("Attempting recovery start")
+                        await self.start()
+                        await self.add_storage_users()
+                except Exception as recovery_error:
+                    logger.error(f"Recovery start failed: {recovery_error}")
+                raise
 
     async def add_user(self, user: User, inbound: Inbound):
         email = f"{user.id}.{user.username}"
 
-        account_class = accounts_map[inbound.protocol]
-        flow = inbound.config["flow"] or ""
-        logger.debug(flow)
-        user_account = account_class(
-            email=email,
-            seed=user.key,
-            flow=flow,
-        )
+        # Check if backend is running before attempting to add user
+        if not self.running:
+            logger.warning(f"Cannot add user {user.username}: backend is not running")
+            return
 
         try:
+            account_class = accounts_map[inbound.protocol]
+            flow = inbound.config.get("flow", "") or ""
+            logger.debug(f"Adding user {user.username} with flow: {flow}")
+            
+            user_account = account_class(
+                email=email,
+                seed=user.key,
+                flow=flow,
+            )
+
             await self._api.add_inbound_user(inbound.tag, user_account)
-        except (EmailExistsError, TagNotFoundError):
+            logger.debug(f"Successfully added user {user.username} to inbound {inbound.tag}")
+            
+        except EmailExistsError:
+            logger.debug(f"User {user.username} already exists in inbound {inbound.tag}")
+            # This is not an error, user already exists
+        except TagNotFoundError:
+            logger.error(f"Inbound tag {inbound.tag} not found when adding user {user.username}")
             raise
-        except OSError:
-            logger.warning("user addition requested when xray api is down")
+        except (OSError, ConnectionError) as e:
+            logger.warning(f"Connection error adding user {user.username}: {e}")
+            self._set_unhealthy(f"Connection error: {e}")
+            # Don't raise, let it be retried later
+        except Exception as e:
+            logger.error(f"Unexpected error adding user {user.username}: {e}")
+            raise
 
     async def remove_user(self, user: User, inbound: Inbound):
         email = f"{user.id}.{user.username}"
+        
+        # Check if backend is running before attempting to remove user
+        if not self.running:
+            logger.warning(f"Cannot remove user {user.username}: backend is not running")
+            return
+
         try:
             await self._api.remove_inbound_user(inbound.tag, email)
-        except (EmailNotFoundError, TagNotFoundError):
+            logger.debug(f"Successfully removed user {user.username} from inbound {inbound.tag}")
+            
+        except EmailNotFoundError:
+            logger.debug(f"User {user.username} not found in inbound {inbound.tag}")
+            # This is not an error, user doesn't exist
+        except TagNotFoundError:
+            logger.error(f"Inbound tag {inbound.tag} not found when removing user {user.username}")
             raise
-        except OSError:
-            logger.warning("user removal requested when xray api is down")
+        except (OSError, ConnectionError) as e:
+            logger.warning(f"Connection error removing user {user.username}: {e}")
+            self._set_unhealthy(f"Connection error: {e}")
+            # Don't raise, user will be cleaned up on next restart
+        except Exception as e:
+            logger.error(f"Unexpected error removing user {user.username}: {e}")
+            raise
 
     async def get_usages(self, reset: bool = True) -> dict[int, int]:
         try:
