@@ -1,0 +1,19 @@
+services:
+  marznode:
+    image: dawsh/marznode:latest
+    restart: always
+    network_mode: host
+    command: [ "sh", "-c", "sleep 10 && python3 marznode.py" ]
+
+    environment:
+      XRAY_EXECUTABLE_PATH: "/usr/local/bin/xray"
+      XRAY_ASSETS_PATH: "/usr/local/lib/xray"
+      XRAY_CONFIG_PATH: "/var/lib/marznode/xray_config.json"
+      SING_BOX_EXECUTABLE_PATH: "/usr/local/bin/sing-box"
+      HYSTERIA_EXECUTABLE_PATH: "/usr/local/bin/hysteria"
+      SSL_CLIENT_CERT_FILE: "/var/lib/marznode/client.pem"
+      SSL_KEY_FILE: "./server.key"
+      SSL_CERT_FILE: "./server.cert"
+
+    volumes:
+      - /var/lib/marznode:/var/lib/marznode
